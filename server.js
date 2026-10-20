@@ -32,6 +32,7 @@ async function outfitsFor(userId) {
   let totalPages = 1;
   do {
     const upstream = new URL(`https://avatar.roblox.com/v2/avatar/users/${userId}/outfits`);
+    upstream.searchParams.set('outfitType', 'Avatar');
     upstream.searchParams.set('page', String(page));
     upstream.searchParams.set('itemsPerPage', '50');
     // La respuesta incluye data y normalmente totalPages; protegemos cambios de formato.
@@ -39,9 +40,10 @@ async function outfitsFor(userId) {
     if (!Array.isArray(json.data)) throw Object.assign(new Error('Formato inesperado de la API de Roblox'), { code: 502 });
     for (const entry of json.data) {
       const id = Number(entry.id);
-      if (Number.isSafeInteger(id) && id > 0 && !used.has(id)) {
+      const outfitType = String(entry.outfitType ?? entry.OutfitType ?? 'Avatar');
+      if (outfitType === 'Avatar' && Number.isSafeInteger(id) && id > 0 && !used.has(id)) {
         used.add(id);
-        found.push({ id, name: String(entry.name || `Outfit ${id}`).slice(0, 100) });
+        found.push({ id, name: String(entry.name || `Outfit ${id}`).slice(0, 100), outfitType });
       }
       if (found.length >= MAX_OUTFITS) break;
     }
