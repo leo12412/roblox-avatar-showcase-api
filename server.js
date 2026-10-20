@@ -10,6 +10,8 @@ const ANIMATION_TYPES = new Set(['climbanimation','fallanimation','idleanimation
 const HEAD_TYPES = new Set(['dynamichead','head','face','faceaccessory','eyebrowaccessory','eyelashaccessory']);
 const FOOTWEAR_TYPES = new Set(['leftshoeaccessory','rightshoeaccessory']);
 const CLOTHING_TYPES = new Set(['shirt','pants','tshirt','jacketaccessory','sweateraccessory','shortsaccessory','dressskirtaccessory','tshirtaccessory','shirtaccessory','pantsaccessory']);
+const CLOTHING_IDS = new Set([2, 11, 12, 64, 65, 66, 67, 68, 69, 72]);
+const STRICT_REQUIRE_CLOTHING = true; // Cambia a false para volver a criterios de V8.
 const BODY_TYPES = new Set(['head','torso','leftarm','rightarm','leftleg','rightleg','dynamichead']);
 const normalize = s => String(s ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
 function send(res, code, data) {
@@ -31,22 +33,30 @@ function typeFromEntry(entry) {
   if (typeof value === 'number') return ({2:'Avatar',3:'DynamicHead',4:'Shoes',5:'Makeup'})[value] || String(value);
   return String(value);
 }
-function getAssetTypes(detail) {
-  if (!Array.isArray(detail.assets)) return [];
-  return detail.assets.map(asset => normalize(asset.assetType?.name ?? asset.assetType?.Name ?? asset.assetType ?? asset.assetTypeName)).filter(Boolean);
+function getAssets(detail) {
+  const raw = detail.assets ?? detail.Assets;
+  if (!Array.isArray(raw)) return null; // null = metadatos no verificados
+  return raw.map(asset => {
+    const type = asset.assetType ?? asset.AssetType;
+    const numeric = Number(type?.id ?? type?.Id ?? asset.assetTypeId ?? asset.AssetTypeId ?? (typeof type === 'number' ? type : NaN));
+    const name = normalize(type?.name ?? type?.Name ?? asset.assetTypeName ?? (typeof type === 'string' ? type : ''));
+    return {id:Number.isInteger(numeric) ? numeric : null, name};
+  });
 }
 function classify(entry, detail) {
   const reportedType = typeFromEntry(entry);
-  if (reportedType && normalize(reportedType) !== 'avatar') return {keep:false, reason:`Tipo ${reportedType}`,reportedType};
-  const types = getAssetTypes(detail);
-  if (!types.length) return {keep:true, reason:'No hay metadatos suficientes para descartar',reportedType};
-  const unique = [...new Set(types)];
-  if (unique.every(t => ANIMATION_TYPES.has(t))) return {keep:false,reason:'Solo animaciones',reportedType};
-  if (unique.every(t => HEAD_TYPES.has(t))) return {keep:false,reason:'Solo cabeza o rostro',reportedType};
-  if (unique.every(t => FOOTWEAR_TYPES.has(t))) return {keep:false,reason:'Solo zapatos',reportedType};
-  // Un paquete de cuerpo puede parecerse a un avatar minimalista. No lo excluimos
-  // automáticamente: hacerlo ocultaría atuendos auténticos.
-  return {keep:true,reason:unique.every(t=>BODY_TYPES.has(t)) ? 'Revisar: solo cuerpo' : 'Apariencia completa o indeterminada',reportedType};
+  if (reportedType && normalize(reportedType) !== 'avatar') return {keep:false,reason:`Tipo ${reportedType}`,reportedType};
+  const assets = getAssets(detail);
+  if (assets === null) return {keep:true,reason:'Revisar: detalles sin lista de assets',reportedType};
+  const names = assets.map(a=>a.name).filter(Boolean);
+  const isClothing = a => CLOTHING_IDS.has(a.id) || CLOTHING_TYPES.has(a.name);
+  if (assets.some(isClothing)) return {keep:true,reason:'Contiene ropa clasica o layered',reportedType};
+  if (assets.length === 0) return {keep:false,reason:'No contiene articulos',reportedType};
+  if (STRICT_REQUIRE_CLOTHING) return {keep:false,reason:'Sin prendas clasicas ni layered (no cuentan zapatos)',reportedType};
+  if (names.length && names.every(t=>ANIMATION_TYPES.has(t))) return {keep:false,reason:'Solo animaciones',reportedType};
+  if (names.length && names.every(t=>HEAD_TYPES.has(t))) return {keep:false,reason:'Solo cabeza o rostro',reportedType};
+  if (names.length && names.every(t=>FOOTWEAR_TYPES.has(t))) return {keep:false,reason:'Solo zapatos',reportedType};
+  return {keep:true,reason:'Sin ropa: permitido por configuracion',reportedType};
 }
 async function listRaw(userId) {
   let page = 1, pages = 1, complete = true;
@@ -88,7 +98,7 @@ async function outfitsFor(userId) {
         results[i]={entry, decision, inspected:true};
       } catch(error) {
         // Fallos transitorios no deben borrar arbitrariamente atuendos válidos.
-        results[i]={entry,decision:{keep:true,reason:'No se pudo verificar el detalle',reportedType:typeFromEntry(entry.raw)},inspected:false};
+        results[i]={entry,decision:{keep:true,reason:'Revisar: no se pudo verificar el detalle',reportedType:typeFromEntry(entry.raw)},inspected:false};
       }
     }
   }
@@ -101,7 +111,7 @@ async function outfitsFor(userId) {
     outfits.push({id:entry.id,name:entry.name,outfitType:'Avatar'});
     if(decision.reason.startsWith('Revisar')||!r.inspected) review.push({id:entry.id,name:entry.name,reason:decision.reason});
   }
-  const data={userId:Number(userId),count:outfits.length,outfits,complete,filterVersion:8,excludedCount:excluded.length,reviewCount:review.length,diagnostic:{excluded,review}};
+  const data={userId:Number(userId),count:outfits.length,outfits,complete,filterVersion:9,excludedCount:excluded.length,reviewCount:review.length,diagnostic:{excluded,review}};
   cache.set(userId,{expires:Date.now()+CACHE_MS,data});
   return data;
 }
@@ -109,7 +119,7 @@ http.createServer(async(req,res)=>{
   if(req.method!=='GET')return send(res,405,{error:'Metodo no permitido'});
   let url;
   try{url=new URL(req.url,'http://localhost');}catch{return send(res,400,{error:'URL invalida'});}
-  if(url.pathname==='/health')return send(res,200,{ok:true,service:'Avatar Showcase API',filterVersion:8});
+  if(url.pathname==='/health')return send(res,200,{ok:true,service:'Avatar Showcase API',filterVersion:9});
   const match=url.pathname.match(/^\/api\/outfits\/([1-9][0-9]{0,15})$/);
   if(!match)return send(res,404,{error:'Ruta no encontrada'});
   const userId=Number(match[1]);
@@ -120,4 +130,4 @@ http.createServer(async(req,res)=>{
     const {diagnostic,...publicData}=data;
     return send(res,200,publicData);
   }catch(error){console.error(error);return send(res,error.code||502,{error:error.message});}
-}).listen(PORT,HOST,()=>console.log(`Avatar Showcase API V8: http://${HOST}:${PORT}`));
+}).listen(PORT,HOST,()=>console.log(`Avatar Showcase API V9: http://${HOST}:${PORT}`));
