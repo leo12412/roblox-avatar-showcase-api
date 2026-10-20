@@ -1,0 +1,8 @@
+{
+  "name": "avatar-showcase-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API intermediaria para listar atuendos publicamente accesibles de Roblox",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" }
+}
