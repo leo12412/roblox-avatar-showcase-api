@@ -4,69 +4,120 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const MAX_PAGES = 10;
 const MAX_OUTFITS = 500;
+const CACHE_MS = 120000;
 const cache = new Map();
-const CACHE_MS = 60_000;
-
+const ANIMATION_TYPES = new Set(['climbanimation','fallanimation','idleanimation','jumpanimation','runanimation','swimanimation','walkanimation','animation','emoteanimation','poseanimation']);
+const HEAD_TYPES = new Set(['dynamichead','head','face','faceaccessory','eyebrowaccessory','eyelashaccessory']);
+const FOOTWEAR_TYPES = new Set(['leftshoeaccessory','rightshoeaccessory']);
+const CLOTHING_TYPES = new Set(['shirt','pants','tshirt','jacketaccessory','sweateraccessory','shortsaccessory','dressskirtaccessory','tshirtaccessory','shirtaccessory','pantsaccessory']);
+const BODY_TYPES = new Set(['head','torso','leftarm','rightarm','leftleg','rightleg','dynamichead']);
+const normalize = s => String(s ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
 function send(res, code, data) {
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.writeHead(code, {'Content-Type': 'application/json; charset=utf-8', 'Cache-Control':'no-store'});
   res.end(JSON.stringify(data));
 }
-async function fetchPage(url) {
-  const response = await fetch(url, {
-    headers: { 'Accept': 'application/json', 'User-Agent': 'AvatarShowcaseLearningProject/1.0' },
-    signal: AbortSignal.timeout(9000)
-  });
+async function getJson(url) {
+  const response = await fetch(url, {headers:{Accept:'application/json','User-Agent':'AvatarShowcaseLearningProject/1.0'},signal:AbortSignal.timeout(10000)});
   if (!response.ok) {
-    const error = new Error('Roblox respondio HTTP ' + response.status);
+    const error = new Error(`Roblox HTTP ${response.status}`);
     error.code = response.status === 429 ? 503 : 502;
     throw error;
   }
   return response.json();
 }
-async function outfitsFor(userId) {
-  const previous = cache.get(userId);
-  if (previous && Date.now() < previous.expires) return previous.data;
-  const found = [];
-  const used = new Set();
-  let page = 1;
-  let totalPages = 1;
+function typeFromEntry(entry) {
+  const value = entry.outfitType ?? entry.OutfitType ?? entry.outfitTypeId;
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') return ({2:'Avatar',3:'DynamicHead',4:'Shoes',5:'Makeup'})[value] || String(value);
+  return String(value);
+}
+function getAssetTypes(detail) {
+  if (!Array.isArray(detail.assets)) return [];
+  return detail.assets.map(asset => normalize(asset.assetType?.name ?? asset.assetType?.Name ?? asset.assetType ?? asset.assetTypeName)).filter(Boolean);
+}
+function classify(entry, detail) {
+  const reportedType = typeFromEntry(entry);
+  if (reportedType && normalize(reportedType) !== 'avatar') return {keep:false, reason:`Tipo ${reportedType}`,reportedType};
+  const types = getAssetTypes(detail);
+  if (!types.length) return {keep:true, reason:'No hay metadatos suficientes para descartar',reportedType};
+  const unique = [...new Set(types)];
+  if (unique.every(t => ANIMATION_TYPES.has(t))) return {keep:false,reason:'Solo animaciones',reportedType};
+  if (unique.every(t => HEAD_TYPES.has(t))) return {keep:false,reason:'Solo cabeza o rostro',reportedType};
+  if (unique.every(t => FOOTWEAR_TYPES.has(t))) return {keep:false,reason:'Solo zapatos',reportedType};
+  // Un paquete de cuerpo puede parecerse a un avatar minimalista. No lo excluimos
+  // automáticamente: hacerlo ocultaría atuendos auténticos.
+  return {keep:true,reason:unique.every(t=>BODY_TYPES.has(t)) ? 'Revisar: solo cuerpo' : 'Apariencia completa o indeterminada',reportedType};
+}
+async function listRaw(userId) {
+  let page = 1, pages = 1, complete = true;
+  const found = [], seen = new Set();
   do {
-    const upstream = new URL(`https://avatar.roblox.com/v2/avatar/users/${userId}/outfits`);
-    upstream.searchParams.set('outfitType', 'Avatar');
-    upstream.searchParams.set('page', String(page));
-    upstream.searchParams.set('itemsPerPage', '50');
-    // La respuesta incluye data y normalmente totalPages; protegemos cambios de formato.
-    const json = await fetchPage(upstream);
-    if (!Array.isArray(json.data)) throw Object.assign(new Error('Formato inesperado de la API de Roblox'), { code: 502 });
-    for (const entry of json.data) {
-      const id = Number(entry.id);
-      const outfitType = String(entry.outfitType ?? entry.OutfitType ?? 'Avatar');
-      if (outfitType === 'Avatar' && Number.isSafeInteger(id) && id > 0 && !used.has(id)) {
-        used.add(id);
-        found.push({ id, name: String(entry.name || `Outfit ${id}`).slice(0, 100), outfitType });
+    const url = new URL(`https://avatar.roblox.com/v2/avatar/users/${userId}/outfits`);
+    url.searchParams.set('outfitType','Avatar');
+    url.searchParams.set('page',String(page));
+    url.searchParams.set('itemsPerPage','50');
+    const json = await getJson(url);
+    if (!Array.isArray(json.data)) throw Object.assign(new Error('Roblox devolvio un formato inesperado'), {code:502});
+    for (const item of json.data) {
+      const id = Number(item.id);
+      if (Number.isSafeInteger(id) && id>0 && !seen.has(id)) {
+        seen.add(id);found.push({id,name:String(item.name||`Outfit ${id}`).slice(0,100),raw:item});
       }
-      if (found.length >= MAX_OUTFITS) break;
+      if(found.length>=MAX_OUTFITS) break;
     }
-    totalPages = Number(json.totalPages);
-    // Algunos formatos entregan nextPageCursor en lugar de totalPages.
-    // No asumimos cómo paginar con cursor; notificamos que puede quedar incompleta.
-    if (!Number.isInteger(totalPages) || totalPages < 1) totalPages = 1;
+    pages = Number(json.totalPages);
+    if(!Number.isInteger(pages)||pages<1) pages=1;
     page++;
-  } while (page <= Math.min(totalPages, MAX_PAGES) && found.length < MAX_OUTFITS);
-  const data = { userId: Number(userId), count: found.length, outfits: found, complete: page > totalPages && found.length < MAX_OUTFITS };
-  cache.set(userId, { data, expires: Date.now() + CACHE_MS });
+  } while(page<=Math.min(pages,MAX_PAGES)&&found.length<MAX_OUTFITS);
+  if(page<=pages || found.length>=MAX_OUTFITS) complete=false;
+  return {found,complete};
+}
+async function outfitsFor(userId) {
+  const cached=cache.get(userId);
+  if(cached&&cached.expires>Date.now())return cached.data;
+  const {found,complete}=await listRaw(userId);
+  let index=0;
+  const results=new Array(found.length);
+  async function worker() {
+    while(index<found.length) {
+      const i=index++;
+      const entry=found[i];
+      try {
+        const detail=await getJson(`https://avatar.roblox.com/v3/outfits/${entry.id}/details`);
+        const decision=classify(entry.raw,detail);
+        results[i]={entry, decision, inspected:true};
+      } catch(error) {
+        // Fallos transitorios no deben borrar arbitrariamente atuendos válidos.
+        results[i]={entry,decision:{keep:true,reason:'No se pudo verificar el detalle',reportedType:typeFromEntry(entry.raw)},inspected:false};
+      }
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(4,found.length)},()=>worker()));
+  const outfits=[], excluded=[], review=[];
+  for(const r of results) {
+    if(!r)continue;
+    const {entry,decision}=r;
+    if(!decision.keep) {excluded.push({id:entry.id,name:entry.name,reason:decision.reason});continue;}
+    outfits.push({id:entry.id,name:entry.name,outfitType:'Avatar'});
+    if(decision.reason.startsWith('Revisar')||!r.inspected) review.push({id:entry.id,name:entry.name,reason:decision.reason});
+  }
+  const data={userId:Number(userId),count:outfits.length,outfits,complete,filterVersion:8,excludedCount:excluded.length,reviewCount:review.length,diagnostic:{excluded,review}};
+  cache.set(userId,{expires:Date.now()+CACHE_MS,data});
   return data;
 }
-const server = http.createServer(async (req, res) => {
-  if (req.method !== 'GET') return send(res, 405, { error: 'Metodo no permitido' });
+http.createServer(async(req,res)=>{
+  if(req.method!=='GET')return send(res,405,{error:'Metodo no permitido'});
   let url;
-  try { url = new URL(req.url, 'http://localhost'); } catch { return send(res, 400, { error: 'URL invalida' }); }
-  if (url.pathname === '/health') return send(res, 200, { ok: true, service: 'Avatar Showcase API' });
-  const match = url.pathname.match(/^\/api\/outfits\/([1-9][0-9]{0,15})$/);
-  if (!match) return send(res, 404, { error: 'Ruta no encontrada' });
-  const userId = Number(match[1]);
-  if (!Number.isSafeInteger(userId)) return send(res, 400, { error: 'UserId invalido' });
-  try { return send(res, 200, await outfitsFor(userId)); }
-  catch (error) { console.error(error.message); return send(res, error.code || 502, { error: error.message }); }
-});
-server.listen(PORT, HOST, () => console.log(`Avatar Showcase API: http://${HOST}:${PORT}`));
+  try{url=new URL(req.url,'http://localhost');}catch{return send(res,400,{error:'URL invalida'});}
+  if(url.pathname==='/health')return send(res,200,{ok:true,service:'Avatar Showcase API',filterVersion:8});
+  const match=url.pathname.match(/^\/api\/outfits\/([1-9][0-9]{0,15})$/);
+  if(!match)return send(res,404,{error:'Ruta no encontrada'});
+  const userId=Number(match[1]);
+  if(!Number.isSafeInteger(userId))return send(res,400,{error:'UserId invalido'});
+  try{
+    const data=await outfitsFor(userId);
+    if(url.searchParams.get('debug')==='1')return send(res,200,data);
+    const {diagnostic,...publicData}=data;
+    return send(res,200,publicData);
+  }catch(error){console.error(error);return send(res,error.code||502,{error:error.message});}
+}).listen(PORT,HOST,()=>console.log(`Avatar Showcase API V8: http://${HOST}:${PORT}`));
